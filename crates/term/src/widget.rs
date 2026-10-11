@@ -21,6 +21,7 @@ use alacritty_terminal::term::TermMode;
 use crate::input::{self, MouseCode};
 use crate::pty::GridSize;
 use crate::render::atlas::Atlas;
+use crate::render::bidi::RowOrder;
 use crate::render::mesh::{self, BuildParams, Snapshot};
 use crate::render::metrics::{CellMetrics, FontSet};
 use crate::render::opacity::see_through;
@@ -248,6 +249,8 @@ struct CachedFrame {
     origin_px: Vec2,
     generation: u32,
     meshes: Vec<Arc<Mesh>>,
+    /// Rows drawn right to left, as last painted: what the pointer is over.
+    orders: Vec<(u16, RowOrder)>,
 }
 
 impl TabView {
@@ -397,6 +400,7 @@ impl TabView {
                 origin_px,
                 generation: shared.generation,
                 meshes,
+                orders: snapshot.orders,
             });
         }
 
@@ -447,11 +451,13 @@ impl TabView {
 
         // Painted here, after the grid mesh: anything drawn before it is
         // covered by the terminal's own background.
+        let orders = self.cached.as_ref().map_or(&[][..], |c| &c.orders[..]);
         if let Some(hints) = &self.hints {
             for (label, row, item) in &hints.items {
-                let x = rect.min.x + (item.col as f32 * metrics.cell_w as f32) / ppp;
+                let (col, len) = drawn_span(orders, *row, item.col, item.len);
+                let x = rect.min.x + (col as f32 * metrics.cell_w as f32) / ppp;
                 let y = rect.min.y + (*row as f32 * metrics.cell_h as f32) / ppp;
-                let w = (item.len as f32 * metrics.cell_w as f32) / ppp;
+                let w = (len as f32 * metrics.cell_w as f32) / ppp;
                 let h = metrics.cell_h as f32 / ppp;
                 painter.rect_filled(
                     Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h)),
@@ -471,11 +477,12 @@ impl TabView {
             }
         }
         if let Some((_, line, col, len)) = &self.hover_target {
-            let x = rect.min.x + (*col as f32 * metrics.cell_w as f32) / ppp;
+            let (col, len) = drawn_span(orders, *line, *col, *len);
+            let x = rect.min.x + (col as f32 * metrics.cell_w as f32) / ppp;
             let y = rect.min.y + ((*line + 1) as f32 * metrics.cell_h as f32 - 2.0) / ppp;
             let underline = Rect::from_min_size(
                 Pos2::new(x, y),
-                Vec2::new((*len as f32 * metrics.cell_w as f32) / ppp, 1.0),
+                Vec2::new((len as f32 * metrics.cell_w as f32) / ppp, 1.0),
             );
             painter.rect_filled(underline, 0.0, shared.theme.ansi[12]);
         }
@@ -624,6 +631,7 @@ impl TabView {
         mode: TermMode,
     ) {
         let mut out: Vec<u8> = Vec::new();
+        let orders = self.cached.as_ref().map_or(&[][..], |c| &c.orders[..]);
         // Something the app draws over the grid in a layer of its own (a bar
         // pinned to its top row) takes the pointer there: a click on it is
         // not a click in the program.
@@ -656,7 +664,7 @@ impl TabView {
                         let Some(code) = button_code(*button) else {
                             continue;
                         };
-                        let (col, line, _) = cell_at(rect, ppp, m, *pos);
+                        let (col, line, _) = grid_cell(orders, cell_at(rect, ppp, m, *pos));
                         if let Some(seq) =
                             input::encode_mouse(code, col, line, *pressed, false, *modifiers, mode)
                         {
@@ -673,7 +681,7 @@ impl TabView {
                         if !motion_wanted {
                             continue;
                         }
-                        let (col, line, _) = cell_at(rect, ppp, m, *pos);
+                        let (col, line, _) = grid_cell(orders, cell_at(rect, ppp, m, *pos));
                         if self.last_motion_cell == Some((col, line)) {
                             continue;
                         }
@@ -714,11 +722,12 @@ impl TabView {
     ) {
         let pointer = ui.input(|i| i.pointer.interact_pos());
         let Some(pos) = pointer else { return };
+        let orders = self.cached.as_ref().map_or(&[][..], |c| &c.orders[..]);
 
         let select_at = |ty: SelectionType, copy: bool| {
             let mut term = session.term.lock();
             let offset = term.grid().display_offset();
-            let (col, vp_line, side) = cell_at(rect, ppp, m, pos);
+            let (col, vp_line, side) = grid_cell(orders, cell_at(rect, ppp, m, pos));
             let point = Point::new(Line(vp_line as i32 - offset as i32), Column(col as usize));
             let mut sel = Selection::new(ty, point, side);
             if ty != SelectionType::Simple {
@@ -748,7 +757,7 @@ impl TabView {
         } else if response.dragged_by(PointerButton::Primary) {
             let mut term = session.term.lock();
             let offset = term.grid().display_offset();
-            let (col, vp_line, side) = cell_at(rect, ppp, m, pos);
+            let (col, vp_line, side) = grid_cell(orders, cell_at(rect, ppp, m, pos));
             let point = Point::new(Line(vp_line as i32 - offset as i32), Column(col as usize));
             if let Some(sel) = &mut term.selection {
                 sel.update(point, side);
@@ -809,7 +818,8 @@ impl TabView {
 
         if mouse_reporting {
             let pos = ui.input(|i| i.pointer.hover_pos()).unwrap_or(rect.min);
-            let (col, line, _) = cell_at(rect, ppp, m, pos);
+            let orders = self.cached.as_ref().map_or(&[][..], |c| &c.orders[..]);
+            let (col, line, _) = grid_cell(orders, cell_at(rect, ppp, m, pos));
             let code = if lines > 0 {
                 MouseCode::WheelUp
             } else {
@@ -1177,7 +1187,8 @@ impl TabView {
         let Some(pos) = pos.filter(|p| ctrl && rect.contains(*p)) else {
             return;
         };
-        let (col, line, _) = cell_at(rect, ppp, m, pos);
+        let orders = self.cached.as_ref().map_or(&[][..], |c| &c.orders[..]);
+        let (col, line, _) = grid_cell(orders, cell_at(rect, ppp, m, pos));
 
         // An OSC 8 hyperlink wins: its URL is in the escape sequence, so the
         // visible text says nothing about it. This is how Claude, `gh`, `ls
@@ -1229,6 +1240,38 @@ fn button_code(button: PointerButton) -> Option<MouseCode> {
         PointerButton::Middle => Some(MouseCode::Middle),
         PointerButton::Secondary => Some(MouseCode::Right),
         _ => None,
+    }
+}
+
+/// A drawn cell → the grid cell it shows. On a row drawn right to left the
+/// column under the pointer is not the cell's column, and the left half of
+/// a right-to-left letter is the end of it, not the start.
+fn grid_cell(orders: &[(u16, RowOrder)], (col, line, side): (u16, u16, Side)) -> (u16, u16, Side) {
+    let Some((_, order)) = orders.iter().find(|(l, _)| *l == line) else {
+        return (col, line, side);
+    };
+    let Some(&logical) = order.to_logical.get(col as usize) else {
+        return (col, line, side);
+    };
+    let side = match (order.rtl.get(logical as usize), side) {
+        (Some(true), Side::Left) => Side::Right,
+        (Some(true), Side::Right) => Side::Left,
+        _ => side,
+    };
+    (logical, line, side)
+}
+
+/// The drawn columns a run of grid cells covers, as its left edge and width.
+/// A path in a Hebrew line is one left-to-right run, so it stays in one
+/// piece on screen; it is just somewhere else.
+fn drawn_span(orders: &[(u16, RowOrder)], line: u16, start: u16, len: u16) -> (u16, u16) {
+    let Some((_, order)) = orders.iter().find(|(l, _)| *l == line) else {
+        return (start, len);
+    };
+    let drawn = (start..start + len).filter_map(|c| order.to_visual.get(c as usize).copied());
+    match (drawn.clone().min(), drawn.max()) {
+        (Some(lo), Some(hi)) => (lo, hi - lo + 1),
+        _ => (start, len),
     }
 }
 
@@ -1289,5 +1332,35 @@ mod swallow_tests {
         assert!(!still_swallowed(true, false, false, false));
         // Nothing swallowed stays nothing.
         assert!(!still_swallowed(false, false, true, false));
+    }
+}
+
+#[cfg(test)]
+mod rtl_pointer_tests {
+    use super::{Side, drawn_span, grid_cell};
+
+    #[test]
+    fn a_click_on_a_hebrew_row_lands_on_the_letter_drawn_there() {
+        use crate::render::bidi::{Dir, order_row};
+        // "ab שלום" padded to 10, drawn right to left: the word at the right
+        // edge, read leftwards, and "ab" to its left.
+        let row: Vec<char> = "ab שלום   ".chars().collect();
+        let orders = vec![(3u16, order_row(&row, Dir::Ltr))];
+        let drawn_at = |logical: usize| orders[0].1.to_visual[logical];
+        // Left to right: "ab " then the word turned round.
+        assert_eq!(drawn_at(0), 0);
+        assert_eq!(drawn_at(3), 6, "ש is drawn last of the word");
+        let (col, line, side) = grid_cell(&orders, (6, 3, Side::Left));
+        assert_eq!((col, line), (3, 3));
+        assert_eq!(
+            side,
+            Side::Right,
+            "the left half of an RTL letter is its end"
+        );
+        // Rows with no order are left alone.
+        assert_eq!(grid_cell(&orders, (6, 4, Side::Left)), (6, 4, Side::Left));
+        // A run of cells reads back as the columns it is drawn over.
+        assert_eq!(drawn_span(&orders, 3, 3, 4), (3, 4));
+        assert_eq!(drawn_span(&orders, 3, 0, 2), (0, 2));
     }
 }
